@@ -1,70 +1,138 @@
-#!/bin/sh
+#!/bin/bash
 #
-#       @(#)runtests
-#
-# runtests script for ACL testing
-REMOTEHOST=nfsserver
-MAXLENGTH=30 # maximum ACL length - NB: the current NFSv4 acl implementation does not allow ACL greater than one page (about 35 entries with 6 character user name length and 10 character domain name)
-NFSMNTDIR=/mnt/nfs-acl
-echo "Test on NFS server $REMOTEHOST"
-ACLTESTDIR=testdir
-ACLTESTFILE=testfile
+# runtests script for NFS ACL testing
 
-USER_NB=20 # total number of users to create
-GRP_NB=20 # total number of groups to create
-FILE_NB=10 # total number of files for the test
-
-# creation of users on the local machine
-for i in 1 2 3 4 5
-do
-	groupadd -g 60$i grp$i
-	useradd -u 60$i  user$i
-done
-
-#  creation of users on the remote machine (removed only at the end of the tests)
-rsh -n $REMOTEHOST python3 $PWD/create_users.py -u 50 -g 50
-
-echo "Starting ACL testing"
-
-echo "Starting BASIC tests"
-
-echo "Creating testing file and directory"
-touch $NFSMNTDIR/$ACLTESTFILE
-mkdir $NFSMNTDIR/$ACLTESTDIR
-if test ! -d $NFSMNTDIR/$ACLTESTDIR
-then
-	echo "Can't make directory $ACLTESTDIR"
-	exit 1
+TCID=nfs-acl
+TST_TOTAL=3
+TST_SETUP=setup
+TST_CLEANUP=cleanup
+TST_NEEDS_TMPDIR=1
+if [ -z "$TMPDIR" ]; then
+    export TMPDIR="/tmp"
 fi
+. tst_test.sh
 
-# File and Directory tree creation test
-echo "Execute acl1 $NFSMNTDIR/$ACLTESTFILE $NFSMNTDIR/$ACLTESTDIR"
-./acl1 $NFSMNTDIR/$ACLTESTFILE $NFSMNTDIR/$ACLTESTDIR
-#./stress $ACLTESTFILE
-for i in 1 2 3 4 5
+setup()
+{
+    IP=`ip a | grep 192.168 | awk '{print $2}' | awk -F '/' '{print $1}'`
+    RHOST=${RHOST:-$IP}
+    RUSER=${RUSER:-root}
+    PASSWD=${PASSWD:-.pasroot}
+    echo "Test on NFS server $RHOST"
+
+    MAXLENGTH=15 # maximum ACL length - the current NFSv4 acl implementation does not allow ACL greater than one page (about 35 entries with 6 character user name length and 10 character domain name)
+    USER_NUM=20  # total number of users to create in stress
+    GRP_NUM=20   # total number of groups to create in stress
+    FILE_NUM=10  # total number of files for the test in stress
+
+    # Remote prepare: Set NFS service and create users on the remote machine (removed only at the end of the tests)
+    SHAREDIR=$TMPDIR/nfs-share
+    EXPORTDIR=$TMPDIR/nfs-export
+
+    ssh $RHOST 'bash -s ' << EOF
+if [ ! -e $SHAREDIR ]; then
+    sudo mkdir -p $SHAREDIR
+ fi
+if [ ! -e $EXPORTDIR ]; then
+    sudo mkdir -p $EXPORTDIR
+fi
+mount --bind $SHAREDIR $EXPORTDIR
+echo "/export 192.168.122.0/24(rw,fsid=0,no_subtree_check,sync)" > /etc/exports
+echo "$EXPORTDIR 192.168.122.0/24(rw,nohide,insecure,no_subtree_check,sync)" >> /etc/exports
+systemctl restart nfs-server.service
+systemctl enable nfs-server.service
+for i in {1..$GRP_NUM}
+do
+    groupadd -g \`expr 500 + \$i\` grp\$i
+done
+for i in {1..$USER_NUM}
+do
+    useradd -g \`expr 500 + \$i\` -m user\$i
+done
+EOF
+    echo "Remote $USER_NUM users and $GRP_NUM groups created"
+
+    # Local prepare: Mount nfs to local dir and create users on the local machine
+    NFSMNTDIR=$TMPDIR/nfs-acl
+    ACLTESTDIR=testdir
+    ACLTESTFILE=testfile
+    if [ ! -e $TMPDIR/nfs-acl ]; then
+	mkdir $TMPDIR/nfs-acl
+    fi
+    mount -t nfs $RHOST:$EXPORTDIR $NFSMNTDIR
+    for i in 1 2 3 4 5
     do
-        userdel user$i
-        groupdel grp$i
+        groupadd -g 60$i grp$i
+	useradd -u 60$i -m user$i
+    done
+    echo "Local user and group created: 601-605"
+}
+
+test1()
+{
+    echo "Starting ACL testing"
+    echo "1#Starting BASIC tests"
+    echo "Creating testing file and directory"
+    touch $NFSMNTDIR/$ACLTESTFILE
+    mkdir $NFSMNTDIR/$ACLTESTDIR
+    if test ! -d $NFSMNTDIR/$ACLTESTDIR
+    then
+	echo "Can't make directory $NFSMNTDIR/$ACLTESTDIR"
+	exit 1
+    fi
+
+    # File and Directory tree creation test
+    echo "Execute acl1 $NFSMNTDIR/$ACLTESTFILE $NFSMNTDIR/$ACLTESTDIR"
+    ./acl1 $NFSMNTDIR/$ACLTESTFILE $NFSMNTDIR/$ACLTESTDIR
+    echo "Basic tests finished"
+}
+
+test2()
+{
+    echo "2#LONG ACL TEST"
+    mkdir $NFSMNTDIR/lacl-testdir
+    ./test_long_acl.sh $MAXLENGTH $NFSMNTDIR/lacl-testdir
+    rm -rf $NFSMNTDIR/lacl-testdir
+    echo "Long ACL test OK with $MAXLENGTH entries"
+}
+
+test3()
+{
+    echo "3#ACL STRESSING TEST"
+    ./setacl_stress.sh 10 $NFSMNTDIR/$ACLTESTDIR
+    echo "ACL stress test finished"
+}
+
+cleanup()
+{
+    # Local clean up
+    umount $NFSMNTDIR
+    for i in {1..5}
+    do
+	userdel -r user$i
+	groupdel grp$i
     done
 
-echo "Basic tests finished"
+    # Remote clean up
+    ssh $RHOST 'bash -s ' << EOF
+for i in {1..$USER_NUM}
+do
+    sudo userdel -r user\$i
+done
+for i in {1..$GRP_NUM}
+do
+    sudo groupdel grp\$i
+done
+sleep 5
+sudo systemctl restart nfs-server.service
+sleep 5
+sudo umount $EXPORTDIR
+EOF
+}
 
-echo "LONG ACL TEST"
-echo "creating necessary users and groups"
-python3 create_users.py -u 50 -g 50
-echo "creating necessary users and groups on the remote host"
-mkdir $NFSMNTDIR/lacl-testdir
-python3 test_long_acl.py -l $MAXLENGTH -p $NFSMNTDIR/lacl-testdir
-rm -rf $NFSMNTDIR/lacl-testdir
-echo "Long ACL test OK with $MAXLENGTH entries"
-echo "ACL STRESSING TEST"
-python3 setacl_stress.py -n 100 -u $USER_NB -g $GRP_NB -f $FILE_NB -p $NFSMNTDIR
+. net_cmdlib.sh
 
-# remove local an remote users
-python3 cleanusers.py
-python3 cleangroups.py
-rsh -n $REMOTEHOST python3 $PWD/cleanusers.py
-
-echo "Test OK"
-
-exit 0
+tst_setup
+setup
+tst_run
+tst_exit

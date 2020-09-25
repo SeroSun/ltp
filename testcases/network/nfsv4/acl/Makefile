@@ -22,8 +22,11 @@
 
 top_srcdir		?= ../../../..
 
+include $(top_srcdir)/include/mk/testcases.mk
+include $(abs_srcdir)/../Makefile.inc
 include $(top_srcdir)/include/mk/env_pre.mk
 
 LDLIBS			+= $(ACL_LIBS)
+INSTALL_TARGETS         := acl* *.sh
 
 include $(top_srcdir)/include/mk/generic_leaf_target.mk
